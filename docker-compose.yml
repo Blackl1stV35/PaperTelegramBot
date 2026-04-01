@@ -1,0 +1,115 @@
+###############################################################################
+# Research Summarization Pipeline — docker-compose.yml
+# REVISED: Targets low-RAM free-tier VMs (1-2 GB RAM, x86_64)
+#
+# Supported providers:
+#   • GCP Always Free   — e2-micro (2 vCPU, 1 GB RAM, 30 GB disk)
+#   • AWS Free Tier     — t2.micro (1 vCPU, 1 GB RAM, 30 GB EBS) [12 mo]
+#   • Azure Free Tier   — B1s (1 vCPU, 1 GB RAM) [12 mo]
+#   • Any cheap VPS     — 1-2 GB RAM, x86_64 or ARM64
+#
+# Key change from Oracle build:
+#   Ollama is REMOVED. LLM inference is offloaded to free external APIs:
+#     • Groq       (free: Llama 3.3 70B, 30 req/min)
+#     • Together   (free: Llama 3.1 8B, 60 req/min)
+#     • Cerebras   (free: Llama 3.3 70B)
+#     • OpenRouter  (free credits on signup)
+#
+# Memory budget (1 GB total):
+#   OS + Docker   ~300 MB
+#   Redis         ~100 MB
+#   API + Bot     ~200 MB
+#   Worker        ~200 MB
+#   Headroom      ~200 MB
+###############################################################################
+
+x-common: &common
+  restart: unless-stopped
+  env_file: .env
+
+services:
+  # ─────────────────────────── Redis ────────────────────────────
+  redis:
+    <<: *common
+    image: redis:7-alpine
+    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 100M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      retries: 5
+
+  # ──────────────── Main API + Telegram Bot + Scheduler ────────
+  api:
+    <<: *common
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./app:/app/app
+      - app_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 250M
+    command: >
+      sh -c "
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+        python -m app.delivery.telegram_bot &
+        python -m app.tasks.scheduler &
+        wait
+      "
+
+  # ──────────────── RQ Worker ──────────────────────────────────
+  worker:
+    <<: *common
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./app:/app/app
+      - app_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 250M
+    command: >
+      rq worker
+        --url redis://redis:6379/0
+        text_pipeline figure_pipeline combine_pipeline
+        --with-scheduler
+
+  # ──────────────── RQ Dashboard (monitoring) ──────────────────
+  rq-dashboard:
+    <<: *common
+    image: eoranged/rq-dashboard:latest
+    ports:
+      - "127.0.0.1:${RQ_DASHBOARD_PORT:-9181}:9181"
+    environment:
+      - RQ_DASHBOARD_REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 80M
+
+volumes:
+  redis_data:
+  app_data:
